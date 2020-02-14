@@ -1,0 +1,514 @@
+---
+title: "Lending Club loan's default rate analysis"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+params:
+  path_to_data_dir: "./data"
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(xgboost)
+library(glmnet)
+library(pROC)
+
+# one-hot encoding function
+one_hot_encode = function(dt, cols, drop_levels = TRUE, sep = "=") {
+  setDT(dt)
+  newDT = copy(dt)
+  newDT[, OHEID := .I]
+  setkey(newDT, OHEID)
+  
+  if(drop_levels) {
+    tempDT = newDT[, c("OHEID", cols), with = FALSE]
+    
+    # unpivot
+    melted = melt(tempDT, "OHEID", value.factor = TRUE)
+    
+    # cleaning level names
+    ## transliteration to ASCII from local encoding + replacing whitespaces with "_"
+    new_levels_names = levels(melted$value) %>%
+      iconv(to="ASCII//TRANSLIT") %>%
+      gsub("\\s+", "_", .)
+    ## changing levels of variable
+    setattr(melted$value, "levels", new_levels_names)
+    
+    # pivot
+    res = dcast(melted, OHEID ~ variable+value, fun.aggregate = length, sep = sep, drop = drop_levels)
+    
+    # joining newly one-hot encoded columns and the rest of the table
+    res = merge(newDT[, !cols, with=FALSE], res)
+    out = res[, !"OHEID"]
+  } else {
+    lll = lapply(cols,
+                 function(col) {
+                   tempDT = newDT[, c("OHEID", col), with = FALSE]
+                   # unpivot
+                   melted = melt(tempDT, "OHEID", value.factor = TRUE)
+                   # cleaning level names
+                   ## transliteration to ASCII from local encoding + replacing whitespaces with "_"
+                   new_levels_names = levels(melted$value) %>%
+                     iconv(to="ASCII//TRANSLIT") %>%
+                     gsub("\\s+", "_", .)
+                   ## changing levels of variable
+                   setattr(melted$value, "levels", new_levels_names)
+                   # pivot
+                   dcast(melted, OHEID ~ variable+value, fun.aggregate = length, sep = sep, drop = drop_levels)
+                 })
+    res = Reduce(merge, lll)
+    res = merge(newDT[, !cols, with=FALSE], res)
+    out = res[, !"OHEID"]
+  }
+  
+  out
+}
+
+`%||%` = function(a, b) paste0(a, b)
+
+# different version of cut()
+potnij = function(x, breaks, right = TRUE, ordered_result = TRUE, sprintf_format = "%.2f", include.lowest = TRUE, codes.only = FALSE) {
+  if (!is.numeric(x))
+    stop("'x' must be numeric")
+  # if (anyDuplicated(breaks))
+  #   stop("'breaks' are not unique")
+
+  if(right) {
+    if(breaks[length(breaks)] < max(x)) breaks = c(breaks, Inf)
+    if(breaks[1] > min(x) || breaks[1] == min(x) && !include.lowest) breaks = c(-Inf, breaks)
+  } else {
+    if(breaks[length(breaks)] < max(x) || breaks[length(breaks)] == max(x) && !include.lowest) breaks = c(breaks, Inf)
+    if(breaks[1] > min(x)) breaks = c(-Inf, breaks)
+  }
+
+
+  # breaks_dec_digits = nchar(sub("(\\d+\\.?)", "", breaks))
+  # if(!is.null(min_decimal_digits)) sprintf_format = "%." %||% pmax(min_decimal_digits, breaks_dec_digits) %||% "f"
+
+  # pasting labels together in "(1; 2]" format
+  # "\u00A0" is a hard space
+  bounds = sprintf(sprintf_format, breaks)
+  left_bound = bounds[-length(breaks)]
+  right_bound = bounds[-1]
+  if(right) {
+    labels = paste0("(", left_bound, ";\u00A0", right_bound, "]")
+  } else {
+    labels = paste0("[", left_bound, ";\u00A0", right_bound, ")")
+  }
+  dup_label = anyDuplicated(labels)
+  if(dup_label > 0 && !codes.only) warning("The label " %||% labels[dup_label] %||% " is duplicated!")
+
+  codes = .bincode(x, breaks, right, include.lowest)
+
+  if (codes.only) {
+    codes
+  } else {
+    factor(codes, seq_along(labels), labels, ordered = ordered_result)
+  }
+}
+
+# load previously prepared objects
+load(params$path_to_data_dir %||% "prepared_objects.RData")
+```
+
+## Dataset preparation
+
+```{r processing}
+## reading the dataset
+dt_loan = fread(params$path_to_data_dir %||% "loan.csv")
+
+## adding issue date column with more convenient data type
+lct <- Sys.getlocale("LC_TIME"); Sys.setlocale("LC_TIME", "C")
+
+dt_loan[, issue_Date := as.Date(paste0("1-", issue_d), format = "%d-%b-%Y")]
+dt_loan[, issue_yyyymm := 100*year(issue_Date) + month(issue_Date)]
+
+# dt_loan[, .N, keyby=.(issue_d, month = month(issue_Date))]
+
+Sys.setlocale("LC_TIME", lct)
+
+```
+
+### Defining defaulted and non-defaulted loans
+
+Adding new column and filling it with 1's for loan statuses indicating default, with 0's for fully paid loans, and with NA for not yet terminated loans.
+
+```{r defaulted_def}
+# 
+dt_loan[, defaulted := NA_integer_]
+dt_loan[loan_status %in% c("Late (31-120 days)", "Charged Off", "Default", "Does not meet the credit policy. Status:Charged Off"), 
+        defaulted := 1L]
+dt_loan[loan_status %in% c("Fully Paid", "Does not meet the credit policy. Status:Fully Paid"), 
+        defaulted := 0L]
+
+# dt_loan[, .N, defaulted]
+target = "defaulted"
+
+```
+
+Terminated (defaulted and non-defaulted) loans will be used to construct a default prediction model.
+
+#### Distributions of loans in time by the month of issue date.
+
+```{r distr}
+dt_loan[, .(.N, issue_Date = max(issue_Date)), keyby=.(issue_yyyymm, defaulted = factor(defaulted))] %>% 
+  ggplot + geom_col(aes(x = issue_Date, y = N, fill = defaulted), position = position_stack()) +
+  ggtitle("Number of defaulted/non-defaulted/NA loans per month")
+
+dt_loan[, .(.N, issue_Date = max(issue_Date)), keyby=.(issue_yyyymm, defaulted = factor(defaulted))] %>% 
+  ggplot + geom_col(aes(x = issue_Date, y = N, fill = defaulted), position = position_fill()) +
+  ggtitle("Share of defaulted/non-defaulted/NA loans per month")
+
+```
+
+#### Default rate
+
+```{r default_rate}
+dt_loan[!is.na(defaulted), .(.N, defaulted = mean(defaulted), issue_Date = max(issue_Date)), keyby=.(issue_yyyymm)] %>% 
+  ggplot + geom_line(aes(x = issue_Date, y = defaulted, group = 1)) +
+  scale_x_date(date_minor_breaks = "1 month") +
+  ggtitle("Default rate per month")
+
+dt_loan[!is.na(defaulted), .(.N, defaulted = mean(defaulted), issue_Date = max(issue_Date)), keyby=.(issue_yyyymm, term)] %>% 
+  ggplot + geom_line(aes(x = issue_Date, y = defaulted, colour = term)) +
+  scale_x_date(date_minor_breaks = "1 month") +
+  ggtitle("Default rate per month and loan term")
+```
+
+Default rate is noticeably different for 36 and 60 month loans. For both of these terms there are sharp increases in default rate - for 36 month term it is for loans issued at the beginning of 2016 and for 60 month term for loans issued 2 years before.
+
+Most of this effect is caused by underrepresentation of loans being paid back on original schedule which are therefore still current and less likely to be charged off at the end of term.
+
+### Preselecting features for modeling
+
+Following list contains variables that mostly regard payment behaviour and therefore contain info we wouldn't have at the moment of a loan request:
+
+```{r selecting_vars_1}
+cols_to_do_away = c("collection_recovery_fee", 
+                    "last_pymnt_amnt", 
+                    "last_pymnt_d", 
+                    "next_pymnt_d", 
+                    "loan_status", 
+                    "out_prncp",
+                    "out_prncp_inv", 
+                    "pymnt_plan", 
+                    "recoveries", 
+                    "total_pymnt", 
+                    "total_pymnt_inv", 
+                    "total_rec_int", 
+                    "total_rec_late_fee",
+                    "total_rec_prncp", 
+                    "hardship_flag", 
+                    "hardship_type", 
+                    "hardship_reason", 
+                    "hardship_status", 
+                    "deferral_term",
+                    "hardship_amount", 
+                    "hardship_start_date", 
+                    "hardship_end_date", 
+                    "payment_plan_start_date", 
+                    "hardship_length",
+                    "hardship_dpd", 
+                    "hardship_loan_status", 
+                    "orig_projected_additional_accrued_interest", 
+                    "hardship_payoff_balance_amount",
+                    "hardship_last_payment_amount", 
+                    "disbursement_method", 
+                    "debt_settlement_flag", 
+                    "debt_settlement_flag_date", 
+                    "settlement_status", 
+                    "settlement_date", 
+                    "settlement_amount", 
+                    "settlement_percentage", 
+                    "settlement_term")
+```
+
+Removing date columns and variables with too many missing values (threshold at 90%)
+
+```{r selecting_vars_2}
+cols_to_do_away = union(cols_to_do_away, c("issue_Date", "issue_d"))
+
+## removing variables with too many missing values
+# computing share of non-missing values for each column, then melting (unpivoting) the result
+dt_fill_prc = dt_loan[, lapply(.SD, function(x) mean(!is.na(x)))] %>% 
+  melt(variable.name = "column", variable.factor = F, value.name = "non_missing_share")
+
+# dt_fill_prc[non_missing_share < 0.9, .N]
+
+
+cols_to_do_away = union(cols_to_do_away,
+                        dt_fill_prc[non_missing_share < 0.9 & column != target, column]
+                        )
+# dropping columns
+set(dt_loan, j = cols_to_do_away, value = NULL)
+```
+
+```{r, include=FALSE}
+gc()
+```
+
+Removing character variables with too many levels, the rest of them will be one-hot encoded
+```{r selecting_vars_3}
+## removing character variables with too many levels
+
+char_cols = setdiff(colnames(dt_loan)[sapply(dt_loan, is.character)], cols_to_do_away)
+dt_loan[, lapply(.SD, uniqueN), .SDcols = char_cols] %>% 
+  melt(variable.name = "column", variable.factor = F, value.name = "unique values")
+
+# reduce number of levels to few most frequent for: purpose and addr_state
+dt_loan[, `:=`(purpose_v2 = ifelse(purpose %in% dt_loan[, .N, purpose][order(-N)][1:6, purpose], purpose, "other"),
+                    addr_state_v2 = ifelse(addr_state %in% dt_loan[, .N, addr_state][order(-N)][1:10, addr_state], addr_state, "other"))]
+
+# character columns which will have their levels encoded with 0/1 flags 
+cols_onehot = c("term", "grade", "emp_length", "home_ownership", 
+                "verification_status", "purpose_v2", "addr_state_v2",
+                "initial_list_status", "application_type")
+
+# not 0/1 encoded columns will be dropped
+cols_to_do_away = setdiff(char_cols, cols_onehot)
+
+# dropping columns
+set(dt_loan, j = cols_to_do_away, value = NULL)
+```
+
+### Filtering data for modeling
+
+For the purpose of modeling default risk, dataset will be filtered by removing not terminated (current) loans. To speed up calculations I will further reduce the size of the dataset, by taking only loans issued between March 2016 and June 2018.
+During these months ratio of defaulted loans was relatively steady, as it is after the spike in defaults around 2015/2016 and before unusually low rate in the most recent data.
+
+```{r}
+dt_loan = dt_loan[!is.na(defaulted) & issue_yyyymm >= 201603 & issue_yyyymm <= 201806]
+```
+
+```{r, include=FALSE}
+gc()
+```
+
+## Modeling default risk
+
+I will use xgboost algorithm as a benchmark for the accuracy that modern black box machine learning algorithm can achieve.
+Then i will train logistic regression model and compare both of them.
+
+Splitting data into train and validation sets:
+
+```{r train_val_dt}
+dt_loan = one_hot_encode(dt_loan, cols = cols_onehot)
+
+dt_train = dt_loan[issue_yyyymm < 201701]
+dt_val = dt_loan[issue_yyyymm >= 201701]
+
+dt_train[, issue_yyyymm := NULL]
+dt_val[, issue_yyyymm := NULL]
+
+```
+
+### xgboost
+
+As a first step I use cross validation on training set to pick optimal values of hyperparameters
+
+```{r xgb_cv, eval=FALSE}
+# data
+xgb_dtrain = xgb.DMatrix(data.matrix(dt_train[, !target, with = F]), label = dt_train[[target]])
+xgb_dval = xgb.DMatrix(data.matrix(dt_val[, !target, with = F]), label = dt_val[[target]])
+
+# list of hyperparameters
+hparams_cv = expand.grid(eta = c(0.05, 0.1), max.depth = c(4, 6), subsample = c(0.8, 1), colsample_bytree = c(0.8, 1)) %>% 
+  split(., seq(nrow(.)))
+
+# wrapper function to run xgboost tree model training and return evaluation metrics for each set of hyperparameters
+xgb_cv_wrapp = function(par) {
+  xgb_cv_it = xgb.cv(par, data = xgb_dtrain, nrounds = 1000, nfold = 5, objective = "binary:logistic",
+                     print_every_n = 10, early_stopping_rounds = 20, metrics = "auc", nthread = 3, stringsAsFactors = FALSE)
+  out = cbind(xgb_cv_it$evaluation_log[xgb_cv_it$best_iteration], par)
+  # out %>% write.table(file = "test.txt", append = T)
+  out
+}
+
+# running loop over parameters
+results = lapply(hparams_cv, xgb_cv_wrapp)
+
+xgb_cv_result = rbindlist(results)
+```
+
+I sort the result by average AUC on out of fold sets (test_auc). Two first rows have very similar scores, I decided to use the parameters with the second best score, because 
+* the difference between the train and test is smaller,
+* it arrived at the best test score in fewer rounds.
+
+```{r xgb_cv_result}
+# xgb_cv_result = fread(params$path_to_data_dir %||% "xgb_cv_result.csv")
+xgb_cv_result[order(-test_auc_mean)]
+```
+
+With the optimal hyperparameter values I train the model once more on a whole training set and use validation set to evaluate accuracy of the model
+
+```{r xgb_pred, eval=FALSE}
+hparams = list(eta = 0.05, max.depth = 4, subsample = 0.8, colsample_bytree = 0.8)
+xgb_1 = xgb.train(hparams, data = xgb_dtrain, nrounds = 750, objective = "binary:logistic", nthread = 3,
+                  watchlist = list(train = xgb_dtrain), eval_metric = "auc", print_every_n = 10)
+
+# predict on validation set
+xgb_pred_val = predict(xgb_1, xgb_dval)
+
+# determine variable importance
+var_imp = xgb.importance(colnames(xgb_dtrain), xgb_1)
+
+```
+
+The most powerful predictors in xgboost model are interest rate, debt to income ratio and average account balance.
+
+```{r xgb_var_imp}
+xgb.plot.importance(var_imp, 30)
+```
+
+### lasso regression
+
+Now I will train logistic regression model with lasso regularization. It will put a penalty on standardized coefficients magnitude in training phase, which should result in shrinking some of them to zero.
+I will use only variables with no missing values, next step could be to impute NAs with sensible values.
+
+```{r lasso_cv, eval=FALSE}
+# predictor variables - with no missing values
+pred_cols = setdiff(colnames(dt_train)[sapply(dt_train, function(x) !any(is.na(x)))], target)
+
+glm_cv1 = cv.glmnet(x = data.matrix(dt_train[, pred_cols, with = F]), 
+                    y = dt_train[[target]], 
+                    family = "binomial", alpha = 1, nfolds = 5)
+
+```
+
+
+
+```{r lasso_plot}
+plot(glm_cv1)
+```
+
+Model with 76 variables got the best (cross validation) score, but simpler model with 33 variables was within 1 standard error of this score, and it will be used for making predictions.
+
+```{r glm_pred, eval=FALSE}
+glm_pred_val = predict.cv.glmnet(glm_cv1, newx = data.matrix(dt_val[, pred_cols, with = F]), type="response", s = "lambda.1se")
+```
+
+## Evaluation
+
+Models will be evaluated on validation set - containing terminated loans that were issued between 01/2017 and 06/2018.
+
+```{r evaluation, include=FALSE}
+dt_evaluation = dt_val[, .(defaulted, loan_amnt, 
+                           term = ifelse(`term=36 months`==1, "36 months", "60 months"), 
+                           xgboost_prediction = xgb_pred_val,
+                           glm_prediction = glm_pred_val)]
+
+dt_evaluation = dt_evaluation[!is.na(glm_prediction)]
+
+dt_evaluation[, `:=`(xgboost_prediction_bin = potnij(100 * xgboost_prediction, 
+                                                     breaks = 100 * 0:20/20, 
+                                                     sprintf_format = "%.0f%%"),
+                     xgboost_prediction_qtile = potnij(100 * xgboost_prediction, 
+                                                       breaks = 100 * quantile(xgboost_prediction, 1:19/20), 
+                                                       sprintf_format = "%.2f%%"),
+                     glm_prediction_bin = potnij(100 * glm_prediction, 
+                                                 breaks = 100 * 0:20/20, 
+                                                 sprintf_format = "%.0f%%"),
+                     glm_prediction_qtile = potnij(100 * glm_prediction, 
+                                                   breaks = 100 * quantile(glm_prediction, 1:19/20), 
+                                                   sprintf_format = "%.2f%%")
+                     )
+              ]
+```
+
+### ROC curves
+
+#### xgboost
+
+```{r xgb_roc, echo=FALSE, message=FALSE}
+dt_evaluation[, plot.roc(defaulted, xgboost_prediction, print.auc = TRUE)]
+# plot.roc(dt_val[[target]], pred_val, print.auc = TRUE)
+```
+
+#### lasso logistic regression
+
+```{r glm_roc, echo=FALSE, message=FALSE}
+dt_evaluation[, plot.roc(defaulted, glm_prediction, print.auc = TRUE)]
+```
+
+### Actual vs. predicted default rate
+
+```{r act_vs_pred}
+
+# Default rate in equally numbered bins of xgboost prediction
+dt_evaluation[, .(default_rate = mean(defaulted), xgboost_prediction = mean(xgboost_prediction)), keyby = xgboost_prediction_qtile] %>%
+  melt(id.vars = "xgboost_prediction_qtile") %>% 
+  ggplot + 
+  geom_line(aes(x = xgboost_prediction_qtile, y = value, colour = variable, group = variable)) + 
+  scale_y_continuous(labels = . %>% {sprintf("%.0f%%", 100*.)} ) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        legend.title = element_blank(), 
+        axis.title = element_blank(), 
+        legend.position = "bottom") +
+  ggtitle("Default rate in equally numbered bins of xgboost prediction")
+
+# Default rate in equally numbered bins of lasso logistic regression prediction
+dt_evaluation[, .(default_rate = mean(defaulted), glm_prediction = mean(glm_prediction)), keyby = glm_prediction_qtile] %>%
+  melt(id.vars = "glm_prediction_qtile") %>% 
+  ggplot + 
+  geom_line(aes(x = glm_prediction_qtile, y = value, colour = variable, group = variable)) + 
+  scale_y_continuous(labels = . %>% {sprintf("%.0f%%", 100*.)} ) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        legend.title = element_blank(), 
+        axis.title = element_blank(), 
+        legend.position = "bottom") +
+  ggtitle("Default rate in equally numbered bins of lasso logistic regression prediction")
+
+
+
+```
+
+### Business impact
+
+Default rate in newly issued loans could be reduced by rejecting some of the riskiest loans.
+
+Cut point for model score above which loans are rejected would have to be regularly adjusted for drifting distribution predictions. 
+
+#### xgboost
+
+```{r xgbb}
+
+dt_evaluation[order(xgboost_prediction), .(xgboost_prediction, 
+                                           xgboost_prediction_qtile, 
+                                           defaulted, 
+                                           rate =cumsum(defaulted)/.I, 
+                                           percentile = .I/.N)][
+  , .("Prediction cut point" = sprintf("%.2f%%", 100*max(xgboost_prediction)), 
+      "Percentile of model scores" = sprintf("%.0f%%", 100*max(percentile)),
+      "Default rate up to percentile" = sprintf("%.2f%%", 100*tail(rate, 1))), 
+  keyby=.("Prediction bin" = xgboost_prediction_qtile)]
+
+```
+
+Rejecting 5% of riskiest loans according to xgboost model would decrease default rate from 26.83% to 24.93% (by 7.1%)
+
+
+#### lasso logistic regression
+
+```{r glmb}
+
+dt_evaluation[order(glm_prediction), .(glm_prediction, 
+                                           glm_prediction_qtile, 
+                                           defaulted, 
+                                           rate =cumsum(defaulted)/.I, 
+                                           percentile = .I/.N)][
+  , .("Prediction cut point" = sprintf("%.2f%%", 100*max(glm_prediction)), 
+      "Percentile of model scores" = sprintf("%.0f%%", 100*max(percentile)),
+      "Default rate up to percentile" = sprintf("%.2f%%", 100*tail(rate, 1))), 
+  keyby=.("Prediction bin" = glm_prediction_qtile)]
+
+```
+
+Rejecting 5% of riskiest loans according to lasso model would decrease default rate from 26.83% to 25.33% (by 5.6%).
+
+### Caveat
+
+Due to my choice of data range, training and validation sets contain loans that were either paid back early or charged off. The loans paid back on schedule, or charged off at the near end of term are not represented. This is likely to introduce bias and skew default rate. 
